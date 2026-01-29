@@ -1,0 +1,4 @@
+# heavy model files should never be committed
+*.bin
+*.gguf
+state.json

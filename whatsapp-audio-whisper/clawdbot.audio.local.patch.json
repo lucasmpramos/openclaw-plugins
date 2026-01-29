@@ -1,0 +1,20 @@
+{
+  "tools": {
+    "media": {
+      "audio": {
+        "enabled": true,
+        "models": [
+          {
+            "type": "cli",
+            "command": "bash",
+            "args": [
+              "-lc",
+              "set -euo pipefail; in=\"{{MediaPath}}\"; tmp=$(mktemp --suffix=.wav); ffmpeg -y -i \"$in\" -ar 16000 -ac 1 -vn \"$tmp\" >/dev/null 2>&1; /usr/local/bin/whisper-cli -m /home/ubuntu/clawd/vendor/whisper.cpp/models/ggml-base.bin -l auto -nt -np \"$tmp\" 2>/dev/null; rm -f \"$tmp\""
+            ],
+            "timeoutSeconds": 240
+          }
+        ]
+      }
+    }
+  }
+}
