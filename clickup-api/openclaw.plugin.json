@@ -1,0 +1,24 @@
+{
+  "id": "clickup-api",
+  "name": "ClickUp API",
+  "description": "Agent tool for managing ClickUp tasks, lists, docs, and time tracking via ClickUp API v2.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiKey": {
+        "type": "string",
+        "description": "ClickUp personal API token (starts with pk_)"
+      },
+      "teamId": {
+        "type": "string",
+        "description": "ClickUp workspace/team ID (numeric string from URL)"
+      },
+      "defaultLimit": {
+        "type": "number",
+        "description": "Default max tasks returned in list/search calls (default: 20)"
+      }
+    },
+    "required": ["apiKey", "teamId"]
+  }
+}
