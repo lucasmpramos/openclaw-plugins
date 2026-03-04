@@ -7,6 +7,7 @@ interface ClickUpConfig {
 }
 
 const BASE_URL = "https://api.clickup.com/api/v2";
+const BASE_URL_V3 = "https://api.clickup.com/api/v3";
 
 const PRIORITY_LABELS: Record<number, string> = { 1: "Urgent", 2: "High", 3: "Normal", 4: "Low" };
 
@@ -47,9 +48,46 @@ async function clickupFetch(
   });
   const data = (await res.json()) as Record<string, unknown>;
   if (!res.ok || data.err) {
-    throw new Error(`${options.method ?? "GET"} ${path} → ${(data.err as string) || `HTTP ${res.status}`}`);
+    throw new Error(
+      `${options.method ?? "GET"} ${path} → ${(data.err as string) || `HTTP ${res.status}`}`,
+    );
   }
   return data;
+}
+
+async function clickupFetchV3(
+  path: string,
+  apiKey: string,
+  options: RequestInit = {},
+): Promise<unknown> {
+  const url = `${BASE_URL_V3}${path}`;
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: apiKey,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  const data = (await res.json()) as Record<string, unknown>;
+  if (!res.ok) {
+    const errMsg = (data.err as string) || (data.message as string) || `HTTP ${res.status}`;
+    throw new Error(`${options.method ?? "GET"} ${path} → ${errMsg}`);
+  }
+  return data;
+}
+
+// ClickUp Docs v3 pages endpoint returns a raw array (not { pages: [] })
+async function fetchDocPages(
+  teamId: string,
+  docId: string,
+  apiKey: string,
+): Promise<Array<Record<string, unknown>>> {
+  const raw = await clickupFetchV3(`/workspaces/${teamId}/docs/${docId}/pages`, apiKey);
+  if (Array.isArray(raw)) return raw as Array<Record<string, unknown>>;
+  // fallback: try .pages property
+  const asObj = raw as Record<string, unknown>;
+  return (asObj.pages as Array<Record<string, unknown>>) || [];
 }
 
 type ActionHandler = (args: Record<string, unknown>, config: ClickUpConfig) => Promise<string>;
@@ -345,6 +383,97 @@ const ACTIONS: Record<string, { desc: string; required?: string[]; handler: Acti
       return `⏱️ Time entry logged: ${mins} min on task ${args.task_id}`;
     },
   },
+
+  // ── Docs (API v3) ────────────────────────────────────────────────────────
+
+  listDocs: {
+    desc: "List docs in the workspace. Args: search(optional string), limit(optional, default 20)",
+    handler: async (args, config) => {
+      let url = `/workspaces/${config.teamId}/docs?limit=${Number(args.limit ?? 20)}`;
+      if (args.search) url += `&search=${encodeURIComponent(String(args.search))}`;
+      const data = (await clickupFetchV3(url, config.apiKey)) as Record<string, unknown>;
+      const docs = (data.docs as Array<Record<string, unknown>>) || [];
+      if (!docs.length) return "No docs found.";
+      const lines = docs.map((d) => {
+        const id = (d.id as string) || "?";
+        const name = (d.name as string) || "Untitled";
+        const creator = ((d.creator as Record<string, unknown>)?.username as string) || "?";
+        const updated = d.date_updated ? formatDate(Number(d.date_updated)) : "—";
+        return `• [${id}] ${name} — by ${creator}, updated ${updated}`;
+      });
+      return `📄 Docs (${docs.length})\n${lines.join("\n")}`;
+    },
+  },
+
+  getDoc: {
+    desc: "Get a doc's details and list its pages. Args: docId",
+    required: ["docId"],
+    handler: async (args, config) => {
+      const data = (await clickupFetchV3(
+        `/workspaces/${config.teamId}/docs/${args.docId}`,
+        config.apiKey,
+      )) as Record<string, unknown>;
+      const name = (data.name as string) || "Untitled";
+      const creator = ((data.creator as Record<string, unknown>)?.username as string) || "?";
+      const updated = data.date_updated ? formatDate(Number(data.date_updated)) : "—";
+
+      // Also fetch pages list
+      let pagesInfo = "";
+      try {
+        const pages = await fetchDocPages(config.teamId, String(args.docId), config.apiKey);
+        if (pages.length) {
+          pagesInfo =
+            `\n\nPages (${pages.length}):\n` +
+            pages.map((p) => `  • [${p.id}] ${(p.name as string) || "Untitled"}`).join("\n");
+        }
+      } catch {
+        /* ignore */
+      }
+
+      return `📄 ${name}\nID: ${args.docId} | Creator: ${creator} | Updated: ${updated}${pagesInfo}`;
+    },
+  },
+
+  getDocPages: {
+    desc: "List all pages in a doc. Args: docId",
+    required: ["docId"],
+    handler: async (args, config) => {
+      const pages = await fetchDocPages(config.teamId, String(args.docId), config.apiKey);
+      if (!pages.length) return "No pages in this doc.";
+      const lines = pages.map((p) => {
+        const id = (p.id as string) || "?";
+        const name = (p.name as string) || "Untitled";
+        const updated = p.date_updated ? formatDate(Number(p.date_updated)) : "—";
+        return `• [${id}] ${name} — updated ${updated}`;
+      });
+      return `📑 Pages (${pages.length})\n${lines.join("\n")}`;
+    },
+  },
+
+  getDocPage: {
+    desc: "Get the full content of a doc page. Args: docId, pageId",
+    required: ["docId", "pageId"],
+    handler: async (args, config) => {
+      const raw = await clickupFetchV3(
+        `/workspaces/${config.teamId}/docs/${args.docId}/pages/${args.pageId}`,
+        config.apiKey,
+      );
+      // API may return a single object or a 1-element array
+      const data = (Array.isArray(raw) ? raw[0] : raw) as Record<string, unknown>;
+      const name = (data.name as string) || "Untitled";
+      const content = (data.content as string) || "";
+      const updated = data.date_updated ? formatDate(Number(data.date_updated)) : "—";
+
+      // Strip basic HTML tags for readability
+      const stripped = content
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s{2,}/g, " ")
+        .trim()
+        .slice(0, 3000);
+
+      return `📑 ${name}\nPage ID: ${args.pageId} | Updated: ${updated}\n\n${stripped || "(empty)"}${content.length > 3000 ? "\n…(truncated)" : ""}`;
+    },
+  },
 };
 
 export function createClickUpApiTool(api: OpenClawPluginApi) {
@@ -410,7 +539,9 @@ ${actionDescriptions}`,
       }
 
       const logger = api.logger;
-      logger?.debug?.(`clickup-api: ${action}${args.listId ? ` list=${args.listId}` : ""}${args.taskId ? ` task=${args.taskId}` : ""}${args.spaceId ? ` space=${args.spaceId}` : ""}`);
+      logger?.debug?.(
+        `clickup-api: ${action}${args.listId ? ` list=${args.listId}` : ""}${args.taskId ? ` task=${args.taskId}` : ""}${args.spaceId ? ` space=${args.spaceId}` : ""}`,
+      );
       try {
         const result = await actionDef.handler(args, config);
         return { content: [{ type: "text", text: result }] };
