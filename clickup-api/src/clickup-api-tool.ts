@@ -465,6 +465,15 @@ const ACTIONS: Record<string, { desc: string; required?: string[]; handler: Acti
     },
   },
 
+  deleteList: {
+    desc: "Delete a list permanently. Args: listId",
+    required: ["listId"],
+    handler: async (args, config) => {
+      await clickupFetch(`/list/${args.listId}`, config.apiKey, { method: "DELETE" });
+      return `🗑️ List ${args.listId} deleted`;
+    },
+  },
+
   createTimeEntry: {
     desc: "Log a time entry. Args: task_id, duration(ms), start(timestamp ms), description(optional)",
     required: ["task_id", "duration", "start"],
