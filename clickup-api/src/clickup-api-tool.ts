@@ -221,7 +221,9 @@ const ACTIONS: Record<string, { desc: string; required?: string[]; handler: Acti
           .map((a) => a.username || a.email)
           .join(", ") || "Unassigned";
       const due = formatDate((t.due_date as string) ? Number(t.due_date) : null);
-      const timeEst = t.time_estimate ? `${Math.round(Number(t.time_estimate) / 3600000 * 10) / 10}h` : "—";
+      const timeEst = t.time_estimate
+        ? `${Math.round((Number(t.time_estimate) / 3600000) * 10) / 10}h`
+        : "—";
       const desc = (t.description as string) || "—";
 
       let out = `📌 ${t.name}\n`;
@@ -237,7 +239,9 @@ const ACTIONS: Record<string, { desc: string; required?: string[]; handler: Acti
         for (const s of subtasks) {
           const sid = (s.custom_id as string) || (s.id as string);
           const sstatus = ((s.status as Record<string, unknown>)?.status as string) || "—";
-          const sest = s.time_estimate ? `${Math.round(Number(s.time_estimate) / 3600000 * 10) / 10}h` : "—";
+          const sest = s.time_estimate
+            ? `${Math.round((Number(s.time_estimate) / 3600000) * 10) / 10}h`
+            : "—";
           out += `  [${sid}] ${s.name} · ${sstatus} · est: ${sest}\n`;
         }
       }
@@ -318,7 +322,11 @@ const ACTIONS: Record<string, { desc: string; required?: string[]; handler: Acti
       if (fields.parent) body.parent = String(fields.parent);
       if (fields.archived != null) body.archived = Boolean(fields.archived);
       // assignees for updateTask uses {add: [userId], rem: [userId]} format (not a plain array)
-      if (fields.assignees && typeof fields.assignees === "object" && !Array.isArray(fields.assignees)) {
+      if (
+        fields.assignees &&
+        typeof fields.assignees === "object" &&
+        !Array.isArray(fields.assignees)
+      ) {
         const a = fields.assignees as Record<string, unknown>;
         body.assignees = {
           add: Array.isArray(a.add) ? (a.add as unknown[]).map(Number) : [],
@@ -399,6 +407,61 @@ const ACTIONS: Record<string, { desc: string; required?: string[]; handler: Acti
         return `• ${user} · ${task} · ${mins} min`;
       });
       return `⏱️ ${entries.length} time entry(ies)\n${lines.join("\n")}`;
+    },
+  },
+
+  createList: {
+    desc: "Create a new list. Args: name, spaceId (for folderless list) OR folderId (for list inside a folder), content(optional), priority(optional 1-4), status(optional)",
+    required: ["name"],
+    handler: async (args, config) => {
+      if (!args.spaceId && !args.folderId) {
+        return "Error: Must provide either spaceId (folderless list) or folderId (list inside a folder)";
+      }
+      const body: Record<string, unknown> = { name: args.name };
+      if (args.content) body.content = args.content;
+      if (args.priority != null) body.priority = Number(args.priority);
+      if (args.status) body.status = args.status;
+
+      const endpoint = args.folderId
+        ? `/folder/${args.folderId}/list`
+        : `/space/${args.spaceId}/list`;
+
+      const data = (await clickupFetch(endpoint, config.apiKey, {
+        method: "POST",
+        body: JSON.stringify(body),
+      })) as Record<string, unknown>;
+
+      return `✅ List created: [${data.id}] ${data.name}`;
+    },
+  },
+
+  moveTask: {
+    desc: "Move a task to a different list. Args: taskId, listId (destination), fromListId (optional — source list to remove from after adding)",
+    required: ["taskId", "listId"],
+    handler: async (args, config) => {
+      // Add task to destination list
+      await clickupFetch(`/list/${args.listId}/task/${args.taskId}`, config.apiKey, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+
+      // Remove from source list if provided
+      if (args.fromListId) {
+        await clickupFetch(`/list/${args.fromListId}/task/${args.taskId}`, config.apiKey, {
+          method: "DELETE",
+        });
+      }
+
+      return `✅ Task ${args.taskId} moved to list ${args.listId}${args.fromListId ? ` (removed from ${args.fromListId})` : ""}`;
+    },
+  },
+
+  deleteTask: {
+    desc: "Delete a task permanently. Args: taskId",
+    required: ["taskId"],
+    handler: async (args, config) => {
+      await clickupFetch(`/task/${args.taskId}`, config.apiKey, { method: "DELETE" });
+      return `🗑️ Task ${args.taskId} deleted`;
     },
   },
 
