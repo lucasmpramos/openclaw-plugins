@@ -1,56 +1,83 @@
----
-name: snowhouse-finance
-description: Parse, translate, categorize, and insert Icelandic bank transactions (Arion Bank) into a Google Sheet for Snowhouse financial tracking. Use when: (1) Luke uploads an Icelandic bank statement xlsx, (2) Luke asks to add new transactions to the Snowhouse sheet, (3) Luke asks about Snowhouse expenses/income/balance, (4) Luke mentions Arion Bank, ISK, or the Snowhouse Google Sheet. Triggers on "bank statement", "transactions", "Arion", "ISK", "snowhouse finance", "add to sheet", "update sheet".
----
+# Snowhouse Finance Skill
 
-# Snowhouse Finance
+Parse Icelandic bank statements (Arion Bank xlsx), translate to English, convert ISK→USD, categorize, and insert into Google Sheets.
 
-Pipeline: xlsx → parse → translate Icelandic → ISK→USD → categorize → deduplicate → insert into Google Sheet → update summary.
-
-## Quick Start
-
-1. Download the xlsx from Slack (use `message download-file` with Slack bot token auth)
-2. Run `scripts/parse_bank_statement.py /path/to/file.xlsx`
-3. Review output — especially "Uncategorized" rows
-4. Run `scripts/insert_to_sheet.py /path/to/parsed.json`
-5. Run `scripts/update_summary.py`
-
-## Sheet Details
-
-- **Sheet ID:** `1wHAon2Q-q-47uCBq0N-QVThktq1j6pn6UugwAwhGUY8`
-- **Tab:** `IS160370266501246501212600` (Arion Bank IS16 0370 2665 0124 6501 2126 00)
-- **Summary Tab:** `Category Summary`
-- **Columns (A-T):** Date, Amount ISK, Balance ISK, Amount USD, Balance USD, Description, Receipt No., Reference, Type, Category (BOB), Transaction Key, Interest Day, Text Key, Payment Bank, Batch No., Interest Date, Recipient/Payer Name, Number, Recipient/Payer ID, Unique Key
+## Google Sheet
+- **ID:** `1wHAon2Q-q-47uCBq0N-QVThktq1j6pn6UugwAwhGUY8`
+- **Tab:** `IS160370266501246501212600`
+- **Columns (A-T):** Date, Amount ISK, Balance ISK, Amount USD, Balance USD, Description, Receipt No., Reference, Type (EN), Category (BOB), Transaction Key, Interest Day, Text Key, Payment Bank, Batch No., Interest Date, Recipient/Payer Name, Number, Recipient/Payer ID, Unique Key
+- **Summary tab:** `Category Summary` (monthly totals)
 
 ## Exchange Rate
+- **Rate:** 0.00807 ISK→USD (closing rate for the month)
+- Store rate in sheet metadata as paper trail
 
-Use the **closing ISK/USD rate for the statement month**. Ask Luke if not provided. Store the rate used in the summary tab.
+## Prerequisites
+- `gog` CLI authenticated (`lucasmpramos@gmail.com` — NOT snowhouse account)
+- `openpyxl` installed (`pip3 install --break-system-packages openpyxl`)
+- Python 3.12+
 
-## Column Layout in xlsx
+## Workflow (follow this order EXACTLY)
 
-Raw Arion exports have rows 0-2 as metadata, row 3 as headers (Icelandic), row 4+ as data. Headers:
+### Step 1: Parse xlsx
+```bash
+python3 ~/.openclaw/skills/snowhouse-finance/scripts/parse_bank_statement.py <file.xlsx> --rate 0.00807
+```
+Output: `<file>_parsed.json` (array of 20-element arrays matching sheet columns)
 
-`Dagsetning` (Date), `Upphæð` (Amount), `Staða` (Balance), `Mynt` (Currency), `Skýring` (Description), `Seðilnúmer` (Receipt No.), `Tilvísun` (Reference), `Texti` (Type), `Færslulykill` (Transaction Key), `Vaxtadagur` (Interest Day), `Textalykill` (Text Key), `Greiðslubanki` (Payment Bank), `Bunkanúmer` (Batch No.), `Vaxtadagsetning` (Interest Date), `Nafn viðtakanda eða greiðanda` (Recipient/Payer), `Númer` (Number), `Kennitala viðtakanda eða greiðanda` (Recipient/Payer ID), `Einkvæmur lykill` (Unique Key)
+### Step 2: Categorize
+```bash
+python3 ~/.openclaw/skills/snowhouse-finance/scripts/categorize.py <file>_parsed.json
+```
+Reads `references/categories.md` for mapping. Uncategorized items get flagged for review.
 
-## Deduplication
+### Step 3: Insert (with dedup + validation)
+```bash
+python3 ~/.openclaw/skills/snowhouse-finance/scripts/insert_to_sheet.py <file>_parsed_categorized.json
+```
+**This script:**
+1. Validates all USD conversions before touching the sheet
+2. Reads ENTIRE current sheet
+3. Deduplicates by Unique Key (col T)
+4. Prepends new rows
+5. Writes ENTIRE sheet back (never partial!)
+6. Verifies insertion by reading back
 
-Use column T (Unique Key) to check against existing sheet data. Only insert rows whose unique key is not already present.
+### Step 4: Update Category Summary
+```bash
+python3 ~/.openclaw/skills/snowhouse-finance/scripts/update_summary.py
+```
 
-## Google Sheets API Auth
+### Step 5: Fix USD (if needed)
+```bash
+python3 ~/.openclaw/skills/snowhouse-finance/scripts/fix_usd.py [--dry-run]
+```
+Recalculates ALL Amount USD and Balance USD columns from ISK values.
 
-`gog sheets` CLI only supports read/update ranges. For row insertion (batchUpdate/insertDimension), use the direct API:
+## ⚠️ CRITICAL RULES (learned from Apr 15 incident)
 
-1. Export token: `gog auth export /tmp/gog_token.json`
-2. Extract refresh_token
-3. Use Python `google.oauth2.credentials` to get access token
-4. `curl` with Bearer token for `batchUpdate` calls
+1. **NEVER use `gog sheets update` on a partial range** — it OVERWRITES existing rows instead of inserting. Always read ALL rows, modify in memory, write ALL rows back.
 
-Account: `lucasmpramos@gmail.com`
+2. **NEVER trust sheet keys after a partial write** — keys get shifted/misaligned. Always match by Unique Key from the xlsx source.
 
-## Categorization
+3. **ALWAYS validate USD amounts before insertion** — a $22k debit card charge is always wrong. The `insert_to_sheet.py` script will abort if validation fails.
 
-See `references/categories.md` for the full vendor→category mapping and type translations. New vendors go to "Uncategorized" for Luke's review — once categorized, add to the mapping file.
+4. **NEVER insert rows manually with `gog sheets update`** — use the script only. Manual = corruption.
 
-## Bonsai Invoices
+5. **Unique Key column (T) is the dedup key** — xlsx column 17 (0-indexed). Not column 18.
 
-Bonsai posts invoice lifecycle events to the Slack channel. Parse from channel history when needed. Pages behind Cloudflare (403) — rely on bot messages only.
+6. **gog account is `lucasmpramos@gmail.com`** — NOT `lucasm@snowhouse.studio`. The snowhouse account doesn't have `gog auth export`.
+
+## Category Reference
+See `references/categories.md` for full mapping of Icelandic vendors → English categories.
+
+## Common Icelandic Terms
+- **Lykill fjármögnun** = Loan Payment (leasing)
+- **CI000...** = Incoming transfer via online banking
+- **Útvextir** = Overdraft interest
+- **Færslugjöld** = Bank fee
+- **Símgreiðsla** = Wire transfer
+- **Debitkortafærsla** = Debit card
+- **Reikningur** = Invoice
+- **Payday ehf.** = Payroll service provider
+- **Arion banki hf.** = Bank fee/transfer (large outgoing = Deel payment)

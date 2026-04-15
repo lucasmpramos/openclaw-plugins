@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Insert categorized rows into the Snowhouse Google Sheet.
 
-Requires: gog CLI authenticated, openpyxl installed.
-Handles deduplication via Unique Key column (T).
+CRITICAL DESIGN DECISIONS (learned from Apr 15 incident):
+1. ALWAYS reads the entire sheet, inserts new rows, and writes back ALL rows
+2. NEVER uses gog sheets update on a partial range (causes overwrites)
+3. Deduplicates by Unique Key (col T) BEFORE insertion
+4. Validates USD amounts after insertion (sanity checks)
+5. Preserves sort order (date descending)
+
+Usage: insert_to_sheet.py <parsed_categorized.json>
 """
 
 import sys
@@ -13,153 +19,149 @@ import os
 SHEET_ID = "1wHAon2Q-q-47uCBq0N-QVThktq1j6pn6UugwAwhGUY8"
 SHEET_NAME = "IS160370266501246501212600"
 GOG_ACCOUNT = "lucasmpramos@gmail.com"
+RATE = 0.00807
+
+env = {**os.environ, "GOG_ACCOUNT": GOG_ACCOUNT}
 
 
-def get_existing_keys():
-    """Fetch existing unique keys from the sheet."""
+def gog_sheets_read(range_str):
+    """Read a range from the sheet, return parsed JSON."""
     result = subprocess.run(
-        ["gog", "sheets", "read", SHEET_ID, f"'{SHEET_NAME}'!T5:T500", "--json"],
-        capture_output=True, text=True, env={**os.environ, "GOG_ACCOUNT": GOG_ACCOUNT}
+        ["gog", "sheets", "read", SHEET_ID, f"'{SHEET_NAME}'!{range_str}", "--json"],
+        capture_output=True, text=True, env=env
     )
-    data = json.loads(result.stdout)
+    if result.returncode != 0:
+        print(f"ERROR reading sheet: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(result.stdout).get('values', [])
+
+
+def gog_sheets_write(range_str, data):
+    """Write data to sheet range."""
+    result = subprocess.run(
+        ["gog", "sheets", "update", SHEET_ID, f"'{SHEET_NAME}'!{range_str}",
+         "--values-json", json.dumps(data), "--no-input"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode != 0:
+        print(f"ERROR writing sheet: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    print(result.stdout.strip())
+
+
+def get_existing_keys(sheet_rows):
+    """Extract unique keys from sheet rows (col T, index 19)."""
     keys = set()
-    for r in data.get('values', []):
-        if r and r[0]:
-            keys.add(str(r[0]))
+    for r in sheet_rows:
+        if r and len(r) > 19 and r[19]:
+            keys.add(str(r[19]))
     return keys
 
 
-def deduplicate(rows_json_path, existing_keys):
+def deduplicate(new_rows, existing_keys):
     """Remove rows whose unique key already exists in the sheet."""
-    with open(rows_json_path) as f:
-        rows = json.load(f)
-    
-    new_rows = []
+    to_add = []
     skipped = 0
-    for row in rows:
-        # Unique key is column T (index 19)
-        if len(row) > 19 and row[19] and str(row[19]) in existing_keys:
+    for row in new_rows:
+        key = str(row[19]) if len(row) > 19 else ''
+        if key and key in existing_keys:
             skipped += 1
         else:
-            new_rows.append(row)
-    
-    return new_rows, skipped
+            to_add.append(row)
+    return to_add, skipped
 
 
-def get_access_token():
-    """Get fresh Google access token via gog auth export."""
-    # Export token
-    token_path = "/tmp/gog_token_finance.json"
-    subprocess.run(["gog", "auth", "export", token_path], capture_output=True)
-    
-    with open(token_path) as f:
-        token_data = json.load(f)
-    
-    # Refresh using stored credentials
-    cred_path = os.path.expanduser("~/Library/Application Support/gogcli/credentials.json")
-    with open(cred_path) as f:
-        creds = json.load(f)
-    
-    import urllib.request, urllib.parse
-    data = urllib.parse.urlencode({
-        'client_id': creds['client_id'],
-        'client_secret': creds['client_secret'],
-        'refresh_token': token_data['refresh_token'],
-        'grant_type': 'refresh_token'
-    }).encode()
-    
-    req = urllib.request.Request('https://oauth2.googleapis.com/token', data=data)
-    resp = urllib.request.urlopen(req)
-    result = json.loads(resp.read())
-    
-    with open('/tmp/gog_access_token.txt', 'w') as f:
-        f.write(result['access_token'])
-    
-    return result['access_token']
+def validate_usd(row):
+    """Sanity check USD conversion for a single row.
+    Returns list of warnings."""
+    warnings = []
+    try:
+        amt_isk = float(str(row[1]).replace(',', ''))
+        amt_usd = float(str(row[3]).replace(',', ''))
+        bal_isk = float(str(row[2]).replace(',', ''))
+        bal_usd = float(str(row[4]).replace(',', ''))
+
+        expected_amt = round(amt_isk * RATE, 2)
+        expected_bal = round(bal_isk * RATE, 2)
+
+        if abs(amt_usd - expected_amt) > 1:
+            warnings.append(f"Amount USD wrong: {amt_usd} (expected {expected_amt}) for {row[5]}")
+        if abs(bal_usd - expected_bal) > 1:
+            warnings.append(f"Balance USD wrong: {bal_usd} (expected {expected_bal}) for {row[5]}")
+
+        # Flag unreasonable amounts (> $10k for a single debit card transaction)
+        desc = str(row[5]).lower()
+        type_en = str(row[8]).lower()
+        if 'debit card' in type_en and abs(amt_usd) > 10000:
+            warnings.append(f"SUSPICIOUS: ${amt_usd:,.2f} on debit card ({row[5]})")
+    except (ValueError, IndexError):
+        warnings.append(f"Could not validate row: {row[:6]}")
+    return warnings
 
 
-def insert_rows(rows, access_token):
-    """Insert rows at top of sheet (row 5) using Google Sheets API."""
-    if not rows:
-        print("No new rows to insert.")
+def insert_rows(new_rows_json_path):
+    """Main insertion logic."""
+    # 1. Read new rows from file
+    with open(new_rows_json_path) as f:
+        new_rows = json.load(f)
+
+    if not new_rows:
+        print("No rows in input file.")
         return
-    
-    count = len(rows)
-    print(f"Inserting {count} rows...")
-    
-    # Get sheet tab ID
-    import urllib.request
-    req = urllib.request.Request(
-        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}?fields=sheets.properties"
-    )
-    req.add_header('Authorization', f'Bearer {access_token}')
-    resp = urllib.request.urlopen(req)
-    sheets = json.loads(resp.read())['sheets']
-    tab_id = None
-    for s in sheets:
-        if 'IS16' in s['properties']['title']:
-            tab_id = s['properties']['sheetId']
-            break
-    
-    if tab_id is None:
-        print("ERROR: Could not find sheet tab", file=sys.stderr)
+
+    # 2. Validate USD amounts BEFORE touching the sheet
+    all_warnings = []
+    for row in new_rows:
+        warnings = validate_usd(row)
+        all_warnings.extend(warnings)
+
+    if all_warnings:
+        print("\n⚠️  VALIDATION WARNINGS:")
+        for w in all_warnings:
+            print(f"  - {w}")
+        print("\nAborting to prevent data corruption. Fix warnings above first.")
         sys.exit(1)
-    
-    # Insert empty rows at row 5 (startIndex 4)
-    insert_body = json.dumps({
-        "requests": [{
-            "insertDimension": {
-                "range": {
-                    "sheetId": tab_id,
-                    "dimension": "ROWS",
-                    "startIndex": 4,
-                    "endIndex": 4 + count
-                },
-                "inheritFromBefore": False
-            }
-        }]
-    }).encode()
-    
-    req = urllib.request.Request(
-        f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}:batchUpdate",
-        data=insert_body,
-        method='POST'
-    )
-    req.add_header('Authorization', f'Bearer {access_token}')
-    req.add_header('Content-Type', 'application/json')
-    urllib.request.urlopen(req)
-    print(f"Inserted {count} empty rows.")
-    
-    # Write data via gog CLI
-    env = {**os.environ, "GOG_ACCOUNT": GOG_ACCOUNT}
-    range_str = f"'{SHEET_NAME}'!A5:T{4 + count}"
-    
-    # gog expects JSON array of arrays
-    rows_json = json.dumps(rows)
-    result = subprocess.run(
-        ["gog", "sheets", "update", SHEET_ID, range_str, "--values-json", rows_json, "--no-input"],
-        capture_output=True, text=True, env=env
-    )
-    print(result.stdout.strip())
-    if result.returncode != 0:
-        print(f"ERROR: {result.stderr}", file=sys.stderr)
+
+    # 3. Read entire current sheet
+    print("Reading current sheet...")
+    sheet_rows = gog_sheets_read("A5:T500")
+
+    # 4. Deduplicate
+    existing_keys = get_existing_keys(sheet_rows)
+    to_add, skipped = deduplicate(new_rows, existing_keys)
+
+    print(f"Sheet has {len(sheet_rows)} rows, {len(existing_keys)} unique keys")
+    print(f"Input: {len(new_rows)} rows, {skipped} duplicates, {len(to_add)} new")
+
+    if not to_add:
+        print("\nNothing to insert — all records already exist.")
+        return
+
+    # 5. Prepend new rows (sheet is sorted date descending, new rows should be newer)
+    final = to_add + sheet_rows
+    print(f"\nInserting {len(to_add)} new rows at top. Total: {len(final)} rows")
+
+    # 6. Write ENTIRE sheet back (never partial!)
+    gog_sheets_write(f"A5:T{4 + len(final)}", final)
+
+    # 7. Verify by reading back and checking new rows
+    print("\nVerifying...")
+    verify_rows = gog_sheets_read(f"A5:T{4 + len(to_add)}")
+    errors = 0
+    for i, (expected, actual) in enumerate(zip(to_add, verify_rows)):
+        if expected != actual:
+            print(f"  MISMATCH row {i+5}: expected {expected[:5]}, got {actual[:5] if actual else 'EMPTY'}")
+            errors += 1
+
+    if errors:
+        print(f"\n❌ {errors} rows didn't match after insertion!")
+    else:
+        print(f"\n✅ Done — {len(to_add)} rows inserted and verified.")
 
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: insert_to_sheet.py <rows.json>")
+        print("Usage: insert_to_sheet.py <parsed_categorized.json>")
         sys.exit(1)
-    
-    print("Fetching existing keys for deduplication...")
-    existing_keys = get_existing_keys()
-    print(f"Sheet has {len(existing_keys)} existing keys.")
-    
-    new_rows, skipped = deduplicate(sys.argv[1], existing_keys)
-    print(f"New rows: {len(new_rows)}, Skipped (duplicate): {skipped}")
-    
-    if new_rows:
-        token = get_access_token()
-        insert_rows(new_rows, token)
-        print(f"\n✅ Done — {len(new_rows)} rows inserted into sheet.")
-    else:
-        print("\nNothing to insert — all records already exist.")
+
+    insert_rows(sys.argv[1])
