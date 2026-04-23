@@ -1,0 +1,24 @@
+{
+  "id": "butley-api",
+  "name": "Butley API",
+  "description": "Agent tool for accessing workspace data (tasks, contacts) in Convex Cloud. Authenticated via gatewayToken.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "convexUrl": {
+        "type": "string",
+        "description": "Convex Cloud deployment URL"
+      },
+      "installationId": {
+        "type": "string",
+        "description": "Convex installation ID for this agent"
+      },
+      "gatewayToken": {
+        "type": "string",
+        "description": "Gateway token for agent authentication"
+      }
+    },
+    "required": ["convexUrl", "installationId", "gatewayToken"]
+  }
+}
